@@ -486,6 +486,30 @@ class BaseConsumerSensor(BaseSensorOperator):
             filtered.append(token)
         return filtered
 
+    def _ensure_watcher_fallback_enabled(self, producer_task_state: str | None = None) -> None:
+        """Raise instead of falling back when watcher fallback is disabled.
+
+        Guards every dispatch site of ``_fallback_to_non_watcher_run`` (the method is
+        overridden by test/source sensors without calling super, so the guard lives at
+        the call sites rather than inside the base implementation).
+
+        A fallback after a *successful* producer is always allowed, flag or no flag:
+        it is bounded (manual task clear, sensor retry, or a single resource whose
+        status XCom went missing) and is the designed single-resource re-run path.
+        The flag only stops the unbounded stampede that follows a producer which
+        terminated without reporting anything (failed/skipped).
+        """
+        if producer_task_state == ProducerTaskState.SUCCESS:
+            return
+        if not settings.enable_watcher_fallback:
+            raise AirflowException(
+                f"Producer task '{self.producer_task_id}' terminated in state "
+                f"'{producer_task_state or 'unknown'}' without reporting a status for "
+                f"'{self.model_unique_id}', and watcher fallback is disabled "
+                "(cosmos.enable_watcher_fallback=False). Address the producer failure, "
+                f"then clear the producer task '{self.producer_task_id}' to re-run."
+            )
+
     def _fallback_to_non_watcher_run(self, try_number: int, context: Context) -> bool:
         """
         Handles logic for retrying a failed dbt model execution.
@@ -651,6 +675,7 @@ class BaseConsumerSensor(BaseSensorOperator):
                 self._resource_label.lower(),
                 self.model_unique_id,
             )
+            self._ensure_watcher_fallback_enabled(ProducerTaskState.SKIPPED)
             self._fallback_to_non_watcher_run(try_number=context["ti"].try_number, context=context)
             return
 
@@ -700,6 +725,7 @@ class BaseConsumerSensor(BaseSensorOperator):
             # Producer finished — this is either an automatic retry after
             # the producer completed or a manual task clear from the UI.
             # Fall back to a non-watcher run.
+            self._ensure_watcher_fallback_enabled(producer_task_state)
             return self._fallback_to_non_watcher_run(try_number, context)
         # Producer is still active — the sensor likely timed out while the
         # producer was still working.  Keep polling instead of launching a
@@ -721,9 +747,11 @@ class BaseConsumerSensor(BaseSensorOperator):
                 )
             else:
                 # This handles the scenario of tasks that failed with `State.UPSTREAM_FAILED`
+                self._ensure_watcher_fallback_enabled(producer_task_state)
                 return self._fallback_to_non_watcher_run(try_number, context)
 
         if producer_task_state == ProducerTaskState.SKIPPED:
+            self._ensure_watcher_fallback_enabled(producer_task_state)
             return self._fallback_to_non_watcher_run(try_number, context)
 
         self.poke_retry_number += 1

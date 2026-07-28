@@ -78,6 +78,14 @@ watcher_dbt_execution_queue = conf.get("cosmos", "watcher_dbt_execution_queue", 
 
 enable_watcher_reliable_retry = conf.getboolean("cosmos", "enable_watcher_reliable_retry", fallback=True)
 
+# in watcher mode, when a dbt resource has no reported status because the producer died
+# without emitting it (failed/skipped before running dbt), consumer sensors fall back to
+# running the resource individually. Setting this to False disables that fallback: the
+# consumer fails immediately instead, so a dead producer fails the run fast rather than
+# spawning one fallback execution per resource. Fallbacks after a SUCCESSFUL producer
+# (manual clear / bounded self-heal) remain allowed.
+enable_watcher_fallback = conf.getboolean("cosmos", "enable_watcher_fallback", fallback=True)
+
 # The following environment variable is populated in Astro Cloud
 in_astro_cloud = os.getenv("ASTRONOMER_ENVIRONMENT") == "cloud"
 
