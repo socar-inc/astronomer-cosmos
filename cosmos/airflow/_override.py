@@ -1,13 +1,14 @@
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import timedelta
 from typing import Any
 
 import pendulum
+from airflow.exceptions import AirflowException
 from airflow.providers.cncf.kubernetes import __version__ as airflow_k8s_provider_version
 from airflow.providers.cncf.kubernetes.callbacks import ExecutionMode, KubernetesPodOperatorCallback
-from airflow.providers.cncf.kubernetes.utils.pod_manager import PodLoggingStatus, PodManager
+from airflow.providers.cncf.kubernetes.utils.pod_manager import PodLoggingStatus, PodManager, get_container_status
 from airflow.utils.timezone import utcnow
 from kubernetes import client
 from kubernetes.client.models.v1_pod import V1Pod
@@ -16,6 +17,18 @@ from pendulum import DateTime
 from urllib3.exceptions import HTTPError, TimeoutError
 
 from cosmos.constants import _K8s_WATCHER_MIN_K8S_PROVIDER_VERSION
+
+
+def _iter_raw_log_lines(response: Any) -> Iterator[bytes]:
+    """Split a finite HTTP body without losing split UTF-8 or an unterminated last line."""
+    pending = b""
+    for chunk in response.stream(amt=65536, decode_content=True):
+        lines = (pending + chunk).split(b"\n")
+        pending = lines.pop()
+        for line in lines:
+            yield line + b"\n"
+    if pending:
+        yield pending
 
 
 # This is being added to overcome the issue with the KubernetesPodOperator logs repeating:
@@ -71,150 +84,161 @@ class CosmosKubernetesPodManager(PodManager):  # type: ignore[misc]
         :meta private:
         """
 
-        def consume_logs(  # noqa: C901
-            *, since_time: DateTime | None = None
-        ) -> tuple[DateTime | None, Exception | None]:
-            """
-            Try to follow container logs until container completes.
+        if Version(airflow_k8s_provider_version) >= Version("10.10.0"):
+            from airflow.providers.cncf.kubernetes.utils.pod_manager import parse_log_line
+        elif Version(airflow_k8s_provider_version) >= _K8s_WATCHER_MIN_K8S_PROVIDER_VERSION:
+            parse_log_line = self.parse_log_line
+        else:
+            raise ValueError(
+                f"Unsupported K8s provider version: {airflow_k8s_provider_version}. "
+                f"Minimum required version is {_K8s_WATCHER_MIN_K8S_PROVIDER_VERSION}"
+            )
 
-            For a long-running container, sometimes the log read may be interrupted
-            Such errors of this kind are suppressed.
+        request_timeout = (60 * 30, 60 * 5)
+        last_log_time = since_time
+        replay_all = since_time is not None
+        pod_identity = (pod.metadata.name, pod.metadata.namespace, pod.metadata.uid)
+        if not pod_identity[2]:
+            # KPO returns the original request object after creating a new Pod,
+            # without the server-assigned UID. Pin it before processing any logs.
+            remote = self.read_pod(pod)
+            if (remote.metadata.name, remote.metadata.namespace) != pod_identity[:2] or not remote.metadata.uid:
+                raise AirflowException("Pod identity could not be established before reading container logs")
+            pod_identity = (remote.metadata.name, remote.metadata.namespace, remote.metadata.uid)
 
-            Returns the last timestamp observed in logs.
-            """
-            # Cosmos implementation difference when compared to proposal to fix the issue in the upstream provider:
-            # https://github.com/apache/airflow/pull/59372/
-            if Version(airflow_k8s_provider_version) >= Version("10.10.0"):
-                from airflow.providers.cncf.kubernetes.utils.pod_manager import parse_log_line
-            elif (
-                Version(airflow_k8s_provider_version) >= _K8s_WATCHER_MIN_K8S_PROVIDER_VERSION
-            ):  # Successfully tested with Airflow 3.1.0 and K8s provider 10.8.0 and 10.9.0
-                parse_log_line = self.parse_log_line
-            else:
-                raise ValueError(
-                    f"Unsupported K8s provider version: {airflow_k8s_provider_version}. "
-                    f"Minimum required version is {_K8s_WATCHER_MIN_K8S_PROVIDER_VERSION}"
-                )
-            # Cosmos custom implementation finishes here.
+        def process_logs(logs: Iterator[bytes], *, ignore_before: DateTime | None = None) -> None:
+            """Use the same multiline, callback and logging path for live and finite reads."""
+            nonlocal last_log_time
+            message_to_log = None
+            message_timestamp = None
 
-            exception = None
-            last_captured_timestamp = None
-            # We timeout connections after 30 minutes because otherwise they can get
-            # stuck forever. The 30 is somewhat arbitrary.
-            # As a consequence, a TimeoutError will be raised no more than 30 minutes
-            # after starting read.
-            connection_timeout = 60 * 30
-            # We set a shorter read timeout because that helps reduce *connection* timeouts
-            # (since the connection will be restarted periodically). And with read timeout,
-            # we don't need to worry about either duplicate messages or losing messages; we
-            # can safely resume from a few seconds later
-            read_timeout = 60 * 5
+            def deliver() -> None:
+                nonlocal message_to_log, last_log_time
+                message, message_to_log = message_to_log, None
+                if message is None or (
+                    ignore_before is not None and message_timestamp is not None and message_timestamp < ignore_before
+                ):
+                    return
+                for callback in self._callbacks:
+                    callback.progress_callback(
+                        line=message,
+                        client=self._client,
+                        mode=ExecutionMode.SYNC,
+                        container_name=container_name,
+                        timestamp=message_timestamp,
+                        pod=pod,
+                        **self._extra_kwargs_for(callback),
+                    )
+                self._log_message(message, container_name, container_name_log_prefix_enabled, log_formatter)
+                if message_timestamp is not None and (last_log_time is None or message_timestamp > last_log_time):
+                    last_log_time = message_timestamp
+
             try:
+                for raw_line in logs:
+                    line = raw_line.decode("utf-8", errors="backslashreplace")
+                    line_timestamp, message = parse_log_line(line)
+                    if line_timestamp:
+                        deliver()
+                        message_to_log, message_timestamp = message, line_timestamp
+                    else:
+                        message_to_log = f"{message_to_log}\n{message}"
+            finally:
+                deliver()
+
+        def consume_logs() -> Exception | None:
+            """Suppress only live-read errors, never exceptions raised by callbacks."""
+            exception = None
+
+            def live_lines() -> Iterator[bytes]:
+                nonlocal exception, replay_all
                 since_seconds = None
-                if since_time:
+                if last_log_time:
                     try:
-                        since_seconds = math.ceil((pendulum.now() - since_time).total_seconds())
+                        since_seconds = math.ceil((pendulum.now() - last_log_time).total_seconds())
                     except TypeError:
                         self.log.warning(
-                            "Error calculating since_seconds with since_time %s. Using None instead.",
-                            since_time,
+                            "Error calculating since_seconds with since_time %s. Using None instead.", last_log_time
                         )
-                logs = self.read_pod_logs(
-                    pod=pod,
-                    container_name=container_name,
-                    timestamps=True,
-                    since_seconds=since_seconds,
-                    follow=follow,
-                    post_termination_timeout=post_termination_timeout,
-                    _request_timeout=(connection_timeout, read_timeout),
-                )
-                message_to_log = None
-                message_timestamp = None
-                progress_callback_lines = []
                 try:
-                    for raw_line in logs:
-                        line = raw_line.decode("utf-8", errors="backslashreplace")
-                        line_timestamp, message = parse_log_line(line)
-                        if line_timestamp:  # detect new log line
-                            if message_to_log is None:  # first line in the log
-                                message_to_log = message
-                                message_timestamp = line_timestamp
-                                progress_callback_lines.append(line)
-                            else:  # previous log line is complete
-                                for callback in self._callbacks:
-                                    callback.progress_callback(
-                                        line=message_to_log,
-                                        client=self._client,
-                                        mode=ExecutionMode.SYNC,
-                                        container_name=container_name,
-                                        timestamp=message_timestamp,
-                                        pod=pod,
-                                        **self._extra_kwargs_for(callback),
-                                    )
-                                self._log_message(
-                                    message_to_log,
-                                    container_name,
-                                    container_name_log_prefix_enabled,
-                                    log_formatter,
-                                )
-                                last_captured_timestamp = message_timestamp
-                                message_to_log = message
-                                message_timestamp = line_timestamp
-                                progress_callback_lines = [line]
-                        else:  # continuation of the previous log line
-                            message_to_log = f"{message_to_log}\n{message}"
-                            progress_callback_lines.append(line)
-                finally:
-                    # log the last line and update the last_captured_timestamp
-                    if message_to_log is not None:
-                        for callback in self._callbacks:
-                            callback.progress_callback(
-                                line=message_to_log,
-                                client=self._client,
-                                mode=ExecutionMode.SYNC,
-                                container_name=container_name,
-                                timestamp=message_timestamp,
-                                pod=pod,
-                                **self._extra_kwargs_for(callback),
-                            )
-                        self._log_message(
-                            message_to_log, container_name, container_name_log_prefix_enabled, log_formatter
-                        )
-                    last_captured_timestamp = message_timestamp
-            except TimeoutError as e:
-                # in case of timeout, increment return time by 2 seconds to avoid
-                # duplicate log entries
-                if val := (last_captured_timestamp or since_time):
-                    return val.add(seconds=2), e
-            except HTTPError as e:
-                exception = e
-                self._http_error_timestamps = getattr(self, "_http_error_timestamps", [])
-                self._http_error_timestamps = [
-                    t for t in self._http_error_timestamps if t > utcnow() - timedelta(seconds=60)
-                ]
-                self._http_error_timestamps.append(utcnow())
-                # Log only if more than 2 errors occurred in the last 60 seconds
-                if len(self._http_error_timestamps) > 2:
-                    self.log.exception(
-                        "Reading of logs interrupted for container %r; will retry.",
-                        container_name,
+                    yield from self.read_pod_logs(
+                        pod=pod,
+                        container_name=container_name,
+                        timestamps=True,
+                        since_seconds=since_seconds,
+                        follow=follow,
+                        post_termination_timeout=post_termination_timeout,
+                        _request_timeout=request_timeout,
                     )
-            return last_captured_timestamp or since_time, exception
+                except (TimeoutError, HTTPError) as error:
+                    exception, replay_all = error, True
+                    if not isinstance(error, TimeoutError):
+                        self._http_error_timestamps = getattr(self, "_http_error_timestamps", [])
+                        self._http_error_timestamps = [
+                            t for t in self._http_error_timestamps if t > utcnow() - timedelta(seconds=60)
+                        ]
+                        self._http_error_timestamps.append(utcnow())
+                        if len(self._http_error_timestamps) > 2:
+                            self.log.exception(
+                                "Reading of logs interrupted for container %r; will retry.", container_name
+                            )
+
+            process_logs(live_lines())
+            return exception
+
+        def verify_terminated_pod() -> None:
+            remote = self.read_pod(pod)
+            if (remote.metadata.name, remote.metadata.namespace, remote.metadata.uid) != pod_identity:
+                raise AirflowException("Pod identity changed while draining terminal container logs")
+            status = get_container_status(remote, container_name)
+            if status is None or status.state is None or status.state.terminated is None:
+                raise AirflowException(f"Container {container_name!r} termination is not confirmed")
+
+        def drain_terminal_logs() -> None:
+            verify_terminated_pod()
+            # A terminal container's retained log is finite. The provider reader can
+            # stop at finished_at + 120s even with unread chunks, so bypass only that
+            # iterator. No relative time filter: reconnects may already have skipped
+            # events before the last delivered timestamp.
+            response = self._client.read_namespaced_pod_log(
+                name=pod.metadata.name,
+                namespace=pod.metadata.namespace,
+                container=container_name,
+                follow=False,
+                timestamps=True,
+                _preload_content=False,
+                _request_timeout=request_timeout,
+            )
+            try:
+                # The named Pod can be replaced while the HTTP request opens.
+                # Reject that response before publishing any of its statuses.
+                verify_terminated_pod()
+                response.enforce_content_length = True
+                process_logs(_iter_raw_log_lines(response), ignore_before=None if replay_all else last_log_time)
+                verify_terminated_pod()
+            finally:
+                try:
+                    response.close()
+                finally:
+                    response.release_conn()
 
         # note: `read_pod_logs` follows the logs, so we shouldn't necessarily *need* to
         # loop as we do here. But in a long-running process we might temporarily lose connectivity.
         # So the looping logic is there to let us resume following the logs.
-        last_log_time = since_time
         while True:
-            last_log_time, exc = consume_logs(since_time=last_log_time)
+            exc = consume_logs()
             if not self.container_is_running(pod, container_name=container_name):
+                drain_terminal_logs()
                 return PodLoggingStatus(running=False, last_log_time=last_log_time)
             if not follow:
                 return PodLoggingStatus(running=True, last_log_time=last_log_time)
+            # Even a clean live EOF can leave a gap before the next relative-time
+            # request. Reconcile the full retained log after any reconnect.
+            replay_all = True
             # a timeout is a normal thing and we ignore it and resume following logs
             if not isinstance(exc, TimeoutError):
                 self.log.warning(
-                    "Pod %s log read interrupted but container %s still running. Logs generated in the last one second might get duplicated.",
+                    "Pod %s log read interrupted but container %s still running. "
+                    "Retained logs will be replayed after termination; entries may be repeated.",
                     pod.metadata.name,
                     container_name,
                 )
