@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      AIRFLOW_HOME: ${{ runner.temp }}/socar-watcher-airflow
+      AIRFLOW_HOME: /tmp/socar-watcher-airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       SCARF_NO_ANALYTICS: "true"
     steps:
