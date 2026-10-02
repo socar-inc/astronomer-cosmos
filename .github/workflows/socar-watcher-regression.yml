@@ -50,7 +50,7 @@ jobs:
       - name: Verify the incident runtime versions
         # The canonical matrix name is 1.9, but its bootstrap reads the dbt 1.11 requirements.
         run: |
-          hatch -e tests.py3.11-2.10-1.9 run python -c '
+          hatch -e tests.py3.11-2.10-1.9 run python - <<'PY'
           from importlib.metadata import version
           expected_versions = {
               "apache-airflow": "2.10.5",
@@ -64,7 +64,7 @@ jobs:
               print(f"{package}=={actual}")
               assert actual == expected, (package, actual, expected)
           print("dbt-core==" + version("dbt-core"))
-          '
+          PY
       - name: Run the focused watcher and terminal-log regressions
         env:
           # unit.sh does not forward positional arguments; pytest reads these directly.
