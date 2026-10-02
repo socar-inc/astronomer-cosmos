@@ -721,6 +721,30 @@ class BaseConsumerSensor(BaseSensorOperator):
         Returns the fallback result if the producer has terminated, or None if
         the sensor should continue polling (producer still active).
         """
+        if (
+            try_number > 1
+            and producer_task_state in {ProducerTaskState.FAILED, ProducerTaskState.SKIPPED}
+            and not settings.enable_watcher_fallback
+        ):
+            # A producer retry can restore successful node results before skipping.
+            # Preserve those results without dispatching a new dbt command. Keep
+            # the existing retry path when fallback is enabled or the producer
+            # succeeded, so a manual clear can still re-run a single resource.
+            ti = context["ti"]
+            if is_dbt_node_status_success(self._get_node_status(ti, context)):
+                if not self.is_test_sensor:
+                    self._log_startup_events(ti)
+                self._cache_compiled_sql(ti, context)
+                _log_dbt_event(get_xcom_val(ti, self.producer_task_id, get_dbt_event_xcom_key(self.model_unique_id)))
+                self.log.info(
+                    "Preserving reported success for %s '%s' after producer '%s' ended in state '%s'.",
+                    self._resource_label.lower(),
+                    self.model_unique_id,
+                    self.producer_task_id,
+                    producer_task_state,
+                )
+                return True
+
         if is_producer_task_terminated(producer_task_state):
             # Producer finished — this is either an automatic retry after
             # the producer completed or a manual task clear from the UI.
